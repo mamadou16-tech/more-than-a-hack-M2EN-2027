@@ -1,46 +1,39 @@
-"""The reference baseline: whoever is closest to the ball has it.
+"""Team possession from automatic tracking: nearest player, gap filling, majority-vote smoothing.
 
-This is the floor to beat, and it is deliberately the simplest thing that is not a constant guess.
-Two steps, no model, no training:
+One command regenerates the submission file from the provided tracking data:
 
-  1. For every frame where the tracking sees the ball, find the nearest tracked player and give
-     that player's team the ball. Where the ball is not visible, say D.
-  2. Smooth the result with a centred majority vote, because step 1 alone flickers.
+    python possession/run.py
 
-    pip install -r requirements.txt          # numpy and pandas, nothing else
-    python starter/baseline.py               # writes four submissions and scores them
+It writes possession/output/M2EN.csv (frame,label), 199319 rows. The team name is set in TEAM
+below and must match the registered name exactly; --team overrides it.
 
-numpy only, on purpose: it runs in the same environment as the scorer, so getting to a scored
-submission needs no kloppy, no video decoder and no plotting stack. Reading the raw ATD by hand
-also shows the file format more plainly than a loader would. Expect it to take a minute or two --
-it streams 199319 lines of tracking.
+Method, in three steps
+----------------------
+1. Nearest player. For every frame where the tracking sees the ball, the team of the tracked
+   player closest to the ball is given the ball. Frames without a ball stay undecided.
+2. Gap filling. When the ball is not tracked for at most MAX_GAP frames, the last known team keeps
+   the ball. Longer gaps stay undecided and become D (dead ball) in step 3.
+3. Smoothing. A centred majority vote over +/- WINDOW frames removes one-frame flicker.
 
-Why step 2 is the whole point
------------------------------
-The four variants differ in one number, the smoothing window, and nothing else. Scored on the full
-match they look like this:
+Parameters are fixed by football reasoning, not tuned on the ground truth or on the video
+(the competition rules forbid that):
 
-    baseline_raw          macroF1 0.6532   spellF1 0.0486
-    baseline_smooth25     macroF1 0.6752   spellF1 0.1996
-    baseline_smooth50     macroF1 0.6724   spellF1 0.2433   <- the published floor
-    baseline_smooth125    macroF1 0.6356   spellF1 0.2242
+  MAX_GAP = 125 frames (5 s at 25 fps). A long goalkeeper clearance keeps the ball in the air for
+            roughly 2 to 4 seconds, often out of sight of the tracking, and possession does not
+            change during that time. A gap beyond 5 s looks more like a stoppage (throw-in, free
+            kick, treatment) than an occlusion.
+  WINDOW  = 50 frames (+/- 2 s). Long enough to remove flicker, short enough not to erase real
+            possessions of a few seconds.
 
-macroF1 moves by 0.04 across the whole sweep; spellF1 moves by a factor of five. That is the
-argument EVALUATION.md makes, happening to a real system rather than a synthetic one, and it is why
-the board is ranked on spellF1. Watch your own possession counts fall as the window widens -- the
-raw variant invents several times more possessions than a football match contains.
+Known limits
+------------
+* If the ball lands with the opponent while it is untracked, the change is only seen when the ball
+  is tracked again.
+* The vote can pull the edges of a long gap towards a team by up to WINDOW frames.
+* Only team of the nearest player is used: no notion of control, no Smart Tagging, no homography.
 
-There is a second lesson in these files, and it costs nothing to learn it here rather than on
-results day: on the public five minutes, baseline_smooth125 is the best of the four by a wide
-margin. On the full match it is worse than baseline_smooth50. Tuning the window against the public
-window picks the wrong one. Seventeen possessions cannot rank anything -- see EVALUATION.md.
-
-What this baseline does not do
-------------------------------
-It has no notion of a dead ball beyond "the tracking lost the ball", which is why its D class is
-weak. It ignores the Smart Tagging, the homography and both videos. It ignores possession
-structure entirely -- no notion that possessions have a beginning and an end. Every one of those
-is an opening.
+Only the tactical tracking (BAR-ATH_tactical_atd.xml and BAR-ATH_tactical_atd.txt) is read.
+numpy only; it must be run from a clone of the challenge repository because it imports games.py.
 """
 
 import argparse
@@ -56,16 +49,10 @@ sys.path.insert(0, ROOT)
 from games import GAME, GAMES, require, source_frames  # noqa: E402
 
 # Params
-RESULTS_DIR = os.path.join(ROOT, "evaluation", "results")
-
-# The four published variants: (name, half-width of the majority-vote window, in frames).
-# 0 means no smoothing. 25 frames is one second at 25 fps, so these are +/- 1 s, 2 s and 5 s.
-VARIANTS = (
-    ("baseline_raw", 0),
-    ("baseline_smooth25", 25),
-    ("baseline_smooth50", 50),
-    ("baseline_smooth125", 125),
-)
+TEAM = "M2EN"  # team name as registered: the submission file is <TEAM>.csv
+OUT_DIR = os.path.join(HERE, "output")
+MAX_GAP = 125  # frames: 5 s at 25 fps, see the module docstring
+WINDOW = 50    # half-width of the majority-vote window, in frames (+/- 2 s)
 
 # Raw ATD line: "<frame>:<player>;<player>;...:<ball>", each group "x,y,speed" with NaN for a
 # missing observation. Splitting on ':' gives exactly three parts.
@@ -80,13 +67,8 @@ LABELS = np.array(["H", "A", "D"])
 def team_of_each_track(meta_path):
     """Array over track slots: 0 if the slot belongs to the home team, 1 if away.
 
-    The ATD metadata lists both teams and assigns every track slot to one of them. The first team
-    in the file is the home side -- the FIFA/EPTS convention, and the one kloppy follows when it
-    reports metadata.teams. For this match that is Barcelona, which DATA.md states independently.
-
-    Note what these slots are NOT: there are 46 of them for 22 players on the pitch, they are
-    named "Track 1".."Track 46", and their ShirtNumber is just the slot index. A slot is a
-    tracklet, not a person, and it does not follow one player through the match.
+    The first team in the ATD metadata is the home side (FIFA/EPTS convention). A slot is a
+    tracklet, not a person: there are 46 of them for 22 players on the pitch.
     """
     root = ET.parse(meta_path).getroot()
     team_ids = [team.get("id") for team in root.iter("Team")]
@@ -101,7 +83,7 @@ def team_of_each_track(meta_path):
 
 
 def team_names(meta_path):
-    """(home, away) club names, for printing. The submission wants a side, not a club."""
+    """(home, away) club names, for printing."""
     root = ET.parse(meta_path).getroot()
     return tuple(team.findtext("Name") for team in root.iter("Team"))
 
@@ -109,11 +91,8 @@ def team_names(meta_path):
 def nearest_player_labels(raw_path, team_of_track, n_frames, pitch):
     """Per-frame team of the player closest to the ball. NOBODY where there is no answer.
 
-    Returned as codes rather than letters because the smoothing below counts them.
-
     Coordinates are normalised 0-1 and the pitch is not square, so both axes are scaled to metres
-    before distances are compared. Skipping that would stretch every distance along the short axis
-    and quietly pick the wrong player near the touchlines.
+    before distances are compared.
     """
     length, width = pitch
     out = np.full(n_frames, NOBODY, dtype=np.int8)
@@ -125,9 +104,7 @@ def nearest_player_labels(raw_path, team_of_track, n_frames, pitch):
                 continue
             ball = parts[2]
             if ball[0] == MISSING:
-                # No ball, no answer. 41% of graded frames land here -- see DATA.md. Leaving them
-                # as NOBODY rather than guessing is what makes the D class mean anything at all.
-                continue
+                continue  # ball not tracked: left undecided, handled by fill_gaps
 
             comma = ball.index(",")
             ball_x = float(ball[:comma]) * length
@@ -148,14 +125,34 @@ def nearest_player_labels(raw_path, team_of_track, n_frames, pitch):
     return out
 
 
+def fill_gaps(codes, max_gap):
+    """Carry the last known team across short stretches where the ball is not tracked.
+
+    A gap of at most max_gap frames, preceded by a known team, takes that team. Longer gaps, and
+    gaps before the first tracked ball, stay NOBODY (they become D after smoothing).
+    """
+    out = codes.copy()
+    n = len(codes)
+    last = NOBODY
+    i = 0
+    while i < n:
+        if codes[i] != NOBODY:
+            last = codes[i]
+            i += 1
+            continue
+        j = i
+        while j < n and codes[j] == NOBODY:
+            j += 1
+        if last != NOBODY and (j - i) <= max_gap:
+            out[i:j] = last
+        i = j
+    return out
+
+
 def smooth(codes, window):
     """Majority vote over a centred window of +/- `window` frames. D where nobody has the ball.
 
-    Computed with cumulative sums, so the cost does not grow with the window -- a 125-frame window
-    over 199319 frames is the same work as a 1-frame one.
-
-    Ties go to the home side. With an odd-sized window over two classes a tie needs the two counts
-    to be exactly equal, which is rare and never worth a coin flip.
+    Computed with cumulative sums, so the cost does not grow with the window. Ties go to home.
     """
     if window <= 0:
         return np.where(codes == HOME, "H", np.where(codes == AWAY, "A", "D"))
@@ -176,7 +173,7 @@ def smooth(codes, window):
 
 
 def write_submission(path, labels):
-    """A frame,label CSV -- the whole submission format, in four lines."""
+    """A frame,label CSV, one row per frame, frame counted from 0."""
     folder = os.path.dirname(path)
     if folder and not os.path.isdir(folder):
         os.makedirs(folder)
@@ -188,7 +185,7 @@ def write_submission(path, labels):
 
 
 def build(game=GAME, data_dir=None):
-    """Per-frame team codes for the whole video. The expensive half, run once, smoothed many ways."""
+    """Per-frame team codes for the whole video, straight from the tracking."""
     meta_path, raw_path = require(["atd_meta", "atd_raw"], game, data_dir)
     n_frames = source_frames("tactical", game)
 
@@ -199,28 +196,38 @@ def build(game=GAME, data_dir=None):
     codes = nearest_player_labels(raw_path, team_of_each_track(meta_path), n_frames,
                                   GAMES[game]["pitch"])
     seen = int(np.sum(codes != NOBODY))
-    print("  ball located on {} of {} frames ({:.1f}%)\n".format(
+    print("  ball located on {} of {} frames ({:.1f}%)".format(
         seen, n_frames, 100.0 * seen / n_frames))
     return codes
 
 
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--window", type=int, nargs="+",
-                        help="half-widths to write instead of the four published variants")
-    parser.add_argument("--out", default=RESULTS_DIR, help="where to write")
+    parser.add_argument("--team", default=TEAM,
+                        help="team name exactly as registered; the file is <team>.csv")
+    parser.add_argument("--max-gap", type=int, default=MAX_GAP,
+                        help="longest untracked-ball gap (frames) that keeps the last team")
+    parser.add_argument("--window", type=int, default=WINDOW,
+                        help="half-width of the majority-vote window, in frames")
+    parser.add_argument("--out", default=OUT_DIR, help="output folder")
     args = parser.parse_args()
 
     codes = build()
-    variants = ([("baseline_smooth{}".format(w) if w else "baseline_raw", w)
-                 for w in args.window] if args.window else list(VARIANTS))
+    tracked = int(np.sum(codes != NOBODY))
+    codes = fill_gaps(codes, args.max_gap)
+    filled = int(np.sum(codes != NOBODY)) - tracked
+    print("  gap filling (<= {} frames): {} frames given the last known team".format(
+        args.max_gap, filled))
 
-    for name, window in variants:
-        labels = smooth(codes, window)
-        path = write_submission(os.path.join(args.out, "{}.csv".format(name)), labels)
-        counts = {label: int(np.sum(labels == label)) for label in LABELS}
-        print("{:<20} window +/-{:<4} H {:>6}  A {:>6}  D {:>6}".format(
-            name, window, counts["H"], counts["A"], counts["D"]))
-        print("{:<20} -> {}".format("", os.path.relpath(path, ROOT)))
+    labels = smooth(codes, args.window)
+    path = write_submission(os.path.join(args.out, "{}.csv".format(args.team)), labels)
 
-    print("\nNow score them:  python evaluation/run_evaluation.py")
+    counts = {label: int(np.sum(labels == label)) for label in LABELS}
+    print("\nH {:>6}  A {:>6}  D {:>6}".format(counts["H"], counts["A"], counts["D"]))
+    print("-> {}".format(os.path.relpath(path, ROOT)))
+    print("\nNow check the format:  python evaluation/validate_submission.py {}".format(
+        os.path.relpath(path, ROOT)))
+
+
+if __name__ == "__main__":
+    main()
