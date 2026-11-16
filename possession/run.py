@@ -7,13 +7,16 @@ One command regenerates the submission file from the provided tracking data:
 It writes possession/output/M2EN.csv (frame,label), 199319 rows. The team name is set in TEAM
 below and must match the registered name exactly; --team overrides it.
 
-Method, in three steps
+Method, in four steps
 ----------------------
 1. Nearest player. For every frame where the tracking sees the ball, the team of the tracked
    player closest to the ball is given the ball. Frames without a ball stay undecided.
 2. Gap filling. When the ball is not tracked for at most MAX_GAP frames, the last known team keeps
    the ball. Longer gaps stay undecided and become D (dead ball) in step 3.
 3. Smoothing. A centred majority vote over +/- WINDOW frames removes one-frame flicker.
+4. Still ball. Where the ball is tracked and moves slower than STILL_SPEED for at least
+   STILL_FRAMES consecutive frames, play is stopped (free kick, corner, goal kick, ball placed for
+   a restart) and those frames are written D, overriding steps 1 to 3.
 
 Parameters are fixed by football reasoning, not tuned on the ground truth or on the video
 (the competition rules forbid that):
@@ -24,12 +27,17 @@ Parameters are fixed by football reasoning, not tuned on the ground truth or on 
             kick, treatment) than an occlusion.
   WINDOW  = 50 frames (+/- 2 s). Long enough to remove flicker, short enough not to erase real
             possessions of a few seconds.
+  STILL_SPEED = 0.5 m/s, STILL_FRAMES = 75 (3 s). During play a ball almost never stays below
+            walking pace for 3 seconds; before a restart it does, with the players waiting around.
 
 Known limits
 ------------
 * If the ball lands with the opponent while it is untracked, the change is only seen when the ball
   is tracked again.
 * The vote can pull the edges of a long gap towards a team by up to WINDOW frames.
+* A goalkeeper holding the ball also keeps it nearly still, so that moment is written D. Whether
+  it is a stoppage depends on the organisers' definition; this rule cannot tell the two apart.
+* The still-ball thresholds were chosen by reasoning and not tested against the ground truth.
 * Only team of the nearest player is used: no notion of control, no Smart Tagging, no homography.
 
 Only the tactical tracking (BAR-ATH_tactical_atd.xml and BAR-ATH_tactical_atd.txt) is read.
@@ -53,6 +61,8 @@ TEAM = "M2EN"  # team name as registered: the submission file is <TEAM>.csv
 OUT_DIR = os.path.join(HERE, "output")
 MAX_GAP = 125  # frames: 5 s at 25 fps, see the module docstring
 WINDOW = 50    # half-width of the majority-vote window, in frames (+/- 2 s)
+STILL_SPEED = 0.5   # m/s: below this the ball counts as still
+STILL_FRAMES = 75   # 3 s at 25 fps: a still ball for this long means play is stopped
 
 # Raw ATD line: "<frame>:<player>;<player>;...:<ball>", each group "x,y,speed" with NaN for a
 # missing observation. Splitting on ':' gives exactly three parts.
@@ -89,13 +99,16 @@ def team_names(meta_path):
 
 
 def nearest_player_labels(raw_path, team_of_track, n_frames, pitch):
-    """Per-frame team of the player closest to the ball. NOBODY where there is no answer.
+    """Per-frame team of the player closest to the ball, and the ball speed (m/s, NaN if untracked).
+
+    The team is NOBODY where there is no answer.
 
     Coordinates are normalised 0-1 and the pitch is not square, so both axes are scaled to metres
     before distances are compared.
     """
     length, width = pitch
     out = np.full(n_frames, NOBODY, dtype=np.int8)
+    speed = np.full(n_frames, np.nan)  # ball speed in m/s where the ball is tracked
 
     with open(raw_path) as handle:
         for line in handle:
@@ -108,7 +121,12 @@ def nearest_player_labels(raw_path, team_of_track, n_frames, pitch):
 
             comma = ball.index(",")
             ball_x = float(ball[:comma]) * length
-            ball_y = float(ball[comma + 1:ball.index(",", comma + 1)]) * width
+            second = ball.index(",", comma + 1)
+            ball_y = float(ball[comma + 1:second]) * width
+            try:
+                ball_speed = float(ball[second + 1:])
+            except ValueError:
+                ball_speed = np.nan
 
             best, best_team = None, NOBODY
             for slot, group in enumerate(parts[1].split(GROUP_SEP)):
@@ -122,7 +140,8 @@ def nearest_player_labels(raw_path, team_of_track, n_frames, pitch):
                     best, best_team = distance, team_of_track[slot]
 
             out[int(parts[0]) - 1] = best_team  # frame_id counts from 1, submissions from 0
-    return out
+            speed[int(parts[0]) - 1] = ball_speed
+    return out, speed
 
 
 def fill_gaps(codes, max_gap):
@@ -147,6 +166,20 @@ def fill_gaps(codes, max_gap):
             out[i:j] = last
         i = j
     return out
+
+
+def still_ball_runs(speed, threshold, min_frames):
+    """Boolean mask of the frames inside a run of at least min_frames consecutive frames where the
+    ball is tracked and slower than threshold. Untracked frames (NaN) break a run."""
+    with np.errstate(invalid="ignore"):
+        slow = speed < threshold  # NaN compares False
+    padded = np.concatenate(([False], slow, [False]))
+    change = np.flatnonzero(padded[1:] != padded[:-1])
+    mask = np.zeros(len(speed), dtype=bool)
+    for start, end in zip(change[0::2], change[1::2]):
+        if end - start >= min_frames:
+            mask[start:end] = True
+    return mask
 
 
 def smooth(codes, window):
@@ -193,12 +226,16 @@ def build(game=GAME, data_dir=None):
     print("teams: H = {}, A = {}".format(home, away))
     print("reading {} ...".format(os.path.basename(raw_path)))
 
-    codes = nearest_player_labels(raw_path, team_of_each_track(meta_path), n_frames,
-                                  GAMES[game]["pitch"])
+    codes, speed = nearest_player_labels(raw_path, team_of_each_track(meta_path), n_frames,
+                                         GAMES[game]["pitch"])
     seen = int(np.sum(codes != NOBODY))
     print("  ball located on {} of {} frames ({:.1f}%)".format(
         seen, n_frames, 100.0 * seen / n_frames))
-    return codes
+    known = speed[~np.isnan(speed)]
+    if len(known):
+        print("  ball speed when tracked: median {:.2f} m/s, {:.1f}% below {} m/s".format(
+            float(np.median(known)), 100.0 * float(np.mean(known < STILL_SPEED)), STILL_SPEED))
+    return codes, speed
 
 
 def main():
@@ -209,10 +246,14 @@ def main():
                         help="longest untracked-ball gap (frames) that keeps the last team")
     parser.add_argument("--window", type=int, default=WINDOW,
                         help="half-width of the majority-vote window, in frames")
+    parser.add_argument("--still-speed", type=float, default=STILL_SPEED,
+                        help="ball speed (m/s) below which the ball counts as still")
+    parser.add_argument("--still-frames", type=int, default=STILL_FRAMES,
+                        help="frames the ball must stay still for play to count as stopped")
     parser.add_argument("--out", default=OUT_DIR, help="output folder")
     args = parser.parse_args()
 
-    codes = build()
+    codes, speed = build()
     tracked = int(np.sum(codes != NOBODY))
     codes = fill_gaps(codes, args.max_gap)
     filled = int(np.sum(codes != NOBODY)) - tracked
@@ -220,6 +261,11 @@ def main():
         args.max_gap, filled))
 
     labels = smooth(codes, args.window)
+
+    dead = still_ball_runs(speed, args.still_speed, args.still_frames)
+    labels[dead] = "D"
+    print("  still ball (< {} m/s for >= {} frames): {} frames written D".format(
+        args.still_speed, args.still_frames, int(np.sum(dead))))
     path = write_submission(os.path.join(args.out, "{}.csv".format(args.team)), labels)
 
     counts = {label: int(np.sum(labels == label)) for label in LABELS}
